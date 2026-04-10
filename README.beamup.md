@@ -2,6 +2,11 @@
 
 Questa guida ti spiega come configurare il deploy automatico su **BeamUp** sfruttando la GitHub Action ufficiale di Stremio.
 
+> [!WARNING]
+> **SE HAI FATTO UN FORK DI QUESTO REPOSITORY:**
+> GitHub disabilita le Actions per impostazione predefinita per motivi di sicurezza. 
+> Prima di fare qualsiasi cosa, clicca sulla scheda **"Actions"** in alto e premi il pulsante verde **"I understand my workflows, go ahead and enable them"** (Abilita i workflow). Se non lo fai, i metodi qui sotto non funzioneranno!
+
 ## 🛠️ Configurazione Iniziale
 
 ### 1. Generazione delle Chiavi SSH (Importante)
