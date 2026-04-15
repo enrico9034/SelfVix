@@ -51,8 +51,16 @@ async function auRequest(url: string, opts: any = {}): Promise<Dispatcher.Respon
     return request(url, opts);
 }
 
-// ── Step 1: Resolve Kitsu ID → title + AnimeUnity path via animemapping ──
-async function resolveFromMapping(kitsuId: string, episodeNum: string): Promise<string | null> {
+// Infer dub language from AU path or slug. "-ita" segment → ITA dub, else SUB.
+function inferLang(pathOrTitle: string): 'ITA' | 'SUB' {
+    return /(?:^|[-_/])ita(?:[-_/]|$)/i.test(pathOrTitle) ? 'ITA' : 'SUB';
+}
+
+// Language filter from env (ita | sub | both). Default: both.
+const AU_LANG_PREF = ((process.env.AU_LANG || 'both').toLowerCase()) as 'ita' | 'sub' | 'both';
+
+// ── Step 1: Resolve Kitsu ID → all AnimeUnity paths via animemapping ──
+async function resolveFromMapping(kitsuId: string, episodeNum: string): Promise<string[]> {
     try {
         const ep = parseInt(episodeNum) || 1;
         const url = `${ANIMEMAPPING_BASE}/kitsu/${kitsuId}?ep=${ep}`;
@@ -60,27 +68,26 @@ async function resolveFromMapping(kitsuId: string, episodeNum: string): Promise<
         const { body, statusCode } = await request(url, { headers: { 'Accept': 'application/json' } });
         if (statusCode !== 200) {
             console.log(`[VixCloud] Mapping API returned ${statusCode}`);
-            return null;
+            return [];
         }
         const data: any = await body.json();
-        
-        // Extract animeunity paths from mapping
+
         const auMapping = data?.mappings?.animeunity;
-        if (auMapping) {
-            const paths = Array.isArray(auMapping) ? auMapping : [auMapping];
-            for (const item of paths) {
-                const path = typeof item === 'string' ? item : (item?.path || item?.url || item?.href || null);
-                if (path) {
-                    console.log(`[VixCloud] Mapping found AnimeUnity path: ${path}`);
-                    return path;
-                }
-            }
+        if (!auMapping) {
+            console.log(`[VixCloud] No AnimeUnity path in mapping response`);
+            return [];
         }
-        console.log(`[VixCloud] No AnimeUnity path in mapping response`);
-        return null;
+        const items = Array.isArray(auMapping) ? auMapping : [auMapping];
+        const out: string[] = [];
+        for (const item of items) {
+            const path = typeof item === 'string' ? item : (item?.path || item?.url || item?.href || null);
+            if (path && !out.includes(path)) out.push(path);
+        }
+        if (out.length) console.log(`[VixCloud] Mapping found ${out.length} AnimeUnity path(s): ${out.join(', ')}`);
+        return out;
     } catch (err: any) {
         console.error('[VixCloud] Mapping API error:', err?.message || err);
-        return null;
+        return [];
     }
 }
 
@@ -336,65 +343,63 @@ function ensureM3u8(url: string): string {
 export async function getVixCloudStreams(kitsuId: string, episodeNumber: string = "1"): Promise<{name: string, title: string, url: string}[]> {
     try {
         console.log(`[VixCloud] Resolving kitsu:${kitsuId} ep=${episodeNumber}`);
-        
-        // 1. Try animemapping API first for direct AnimeUnity path
+
         const resolvedEp = await resolveEpisodeFromMapping(kitsuId, episodeNumber);
-        const mappedPath = await resolveFromMapping(kitsuId, episodeNumber);
-        
-        let embedUrl: string | null = null;
-        
-        if (mappedPath) {
-            // We have a direct path from the mapping API
-            embedUrl = await getEmbedUrl(mappedPath, resolvedEp);
-        }
-        
-        // 2. Fallback: search AnimeUnity by title
-        if (!embedUrl) {
+        let paths = await resolveFromMapping(kitsuId, episodeNumber);
+
+        // Fallback: search AnimeUnity by title (single result)
+        if (paths.length === 0) {
             const title = await getKitsuTitle(kitsuId);
             if (!title) {
                 console.log(`[VixCloud] Could not resolve title for kitsu:${kitsuId}`);
                 return [];
             }
             console.log(`[VixCloud] Searching AnimeUnity for title: "${title}"`);
-            
+
             const session = await getAnimeUnitySession();
             const searchResults = await searchAnimeUnity(title, session);
-            
+
             if (searchResults.length === 0) {
                 console.log(`[VixCloud] No AnimeUnity results for "${title}"`);
                 return [];
             }
-            
-            // Use the first matching result
             const anime = searchResults[0];
-            const animePath = `/anime/${anime.id}-${anime.slug}`;
+            paths = [`/anime/${anime.id}-${anime.slug}`];
             console.log(`[VixCloud] Found AnimeUnity: id=${anime.id} slug=${anime.slug}`);
-            
-            embedUrl = await getEmbedUrl(animePath, resolvedEp);
         }
-        
-        if (!embedUrl) {
-            console.log(`[VixCloud] No embed URL found`);
-            return [];
-        }
-        
-        // 3. Extract manifest from VixCloud embed
-        const manifestUrl = await extractVixCloudManifest(embedUrl);
-        if (!manifestUrl) {
-            console.log(`[VixCloud] Failed to extract manifest`);
-            return [];
-        }
-        
-        console.log(`[VixCloud] Raw manifest URL: ${manifestUrl}`);
-        
-        // 4. Wrap through local HLS proxy
-        const proxyToken = makeProxyToken(manifestUrl, VIXCLOUD_HEADERS);
 
-        return [{
-            name: "AU 🤌",
-            title: "VIX 1080 🤌",
-            url: `/proxy/hls/manifest.m3u8?token=${proxyToken}`
-        }];
+        // Apply language preference from AU_LANG env (ita | sub | both)
+        if (AU_LANG_PREF === 'ita' || AU_LANG_PREF === 'sub') {
+            const want = AU_LANG_PREF.toUpperCase() as 'ITA' | 'SUB';
+            const filtered = paths.filter(p => inferLang(p) === want);
+            if (filtered.length) paths = filtered;
+            else console.log(`[VixCloud] AU_LANG=${AU_LANG_PREF} but no matching variant; returning all`);
+        }
+
+        // Resolve each path → embed URL → manifest, in parallel
+        const streams = await Promise.all(paths.map(async (p) => {
+            const lang = inferLang(p);
+            try {
+                const embedUrl = await getEmbedUrl(p, resolvedEp);
+                if (!embedUrl) return null;
+                const manifestUrl = await extractVixCloudManifest(embedUrl);
+                if (!manifestUrl) return null;
+                const proxyToken = makeProxyToken(manifestUrl, VIXCLOUD_HEADERS);
+                const flag = lang === 'ITA' ? '🇮🇹' : '🇯🇵';
+                return {
+                    name: `AU 🤌 ${flag}`,
+                    title: `VIX 1080 · ${lang}`,
+                    url: `/proxy/hls/manifest.m3u8?token=${proxyToken}`
+                };
+            } catch (err: any) {
+                console.error(`[VixCloud] ${lang} path ${p} failed:`, err?.message || err);
+                return null;
+            }
+        }));
+
+        const out = streams.filter((s): s is {name: string, title: string, url: string} => s !== null);
+        if (out.length === 0) console.log(`[VixCloud] No streams produced from ${paths.length} path(s)`);
+        return out;
 
     } catch (err: any) {
         console.error("VixCloud Stream extraction error:", err?.message || err);
