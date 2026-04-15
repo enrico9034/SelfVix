@@ -280,30 +280,12 @@ app.get('/proxy/hls/manifest.m3u8', async (req: any, res: any) => {
     }
 });
 
-/**
- * Some providers prepend a fake 8-byte PNG signature to TS segments.
- * Strip it only when bytes after the header still match TS sync markers.
- */
-function stripFakePngHeader(content: Buffer): Buffer {
-    const pngSig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-    if (content.length <= 8 || !content.subarray(0, 8).equals(pngSig)) {
-        return content;
-    }
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 
-    const tsPayload = content.subarray(8);
-    // MPEG-TS sync byte is 0x47
-    if (tsPayload.length === 0 || tsPayload[0] !== 0x47) {
-        return content;
-    }
-    if (tsPayload.length > 188 && tsPayload[188] !== 0x47) {
-        return content;
-    }
-
-    console.log(`[HLS Proxy] Removed fake PNG header from TS segment (${content.length} -> ${tsPayload.length} bytes)`);
-    return tsPayload;
-}
-
-// ── HLS Proxy: segment proxy ──
+// ── HLS Proxy: segment proxy (streaming) ──
+// Peeks the first 8 bytes of the upstream segment to decide whether to strip
+// a fake PNG signature, then pipes the rest directly to the client without
+// buffering the whole segment in RAM. This slashes time-to-first-byte.
 app.get('/proxy/hls/segment.ts', async (req: any, res: any) => {
     try {
         const token = req.query.token;
@@ -314,27 +296,60 @@ app.get('/proxy/hls/segment.ts', async (req: any, res: any) => {
 
         const upstream = decoded.u;
         const headers = decoded.h || {};
-
         if (!upstream) return res.status(400).send('Missing upstream URL');
 
         const { body, statusCode, headers: respHeaders } = await request(upstream, { headers });
         if (statusCode !== 200) {
+            body.destroy?.();
             return res.status(statusCode || 502).send('Upstream error');
         }
 
-        const contentType = respHeaders['content-type'] || 'video/mp2t';
-        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Type', respHeaders['content-type'] || 'video/mp2t');
         res.setHeader('Cache-Control', 'public, max-age=3600');
+        // Content-Length would be wrong if we strip 8 bytes; let chunked encoding handle it.
 
-        const chunks: Buffer[] = [];
-        for await (const chunk of body) {
-            chunks.push(Buffer.from(chunk));
+        // Accumulate until we have at least 8 bytes, then decide once.
+        let header: Buffer = Buffer.alloc(0);
+        let decided = false;
+        let skip = 0; // bytes to drop from the front of `header` after decision
+
+        const iter = body[Symbol.asyncIterator]();
+        try {
+            while (!decided) {
+                const { value, done } = await iter.next();
+                if (done) {
+                    // Stream ended before 8 bytes — just send what we have.
+                    if (header.length) res.write(header);
+                    return res.end();
+                }
+                const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+                header = header.length ? Buffer.concat([header, chunk]) : chunk;
+                if (header.length >= 8) {
+                    const looksPng = header.subarray(0, 8).equals(PNG_SIG);
+                    // Only strip if the byte right after the fake header is the MPEG-TS sync marker (0x47).
+                    skip = (looksPng && header[8] === 0x47) ? 8 : 0;
+                    decided = true;
+                    if (skip) console.log('[HLS Proxy] Stripping fake PNG header (streamed)');
+                    res.write(header.subarray(skip));
+                }
+            }
+            // Pipe the rest of the body straight through.
+            for await (const chunk of iter as any) {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                if (!res.write(buf)) {
+                    await new Promise<void>((resolve) => res.once('drain', resolve));
+                }
+            }
+            res.end();
+        } catch (streamErr: any) {
+            console.error('[HLS Segment Proxy] stream error:', streamErr?.message || streamErr);
+            if (!res.headersSent) res.status(502);
+            res.end();
         }
-        const fullBuffer = Buffer.concat(chunks);
-        res.send(stripFakePngHeader(fullBuffer));
     } catch (e: any) {
         console.error('[HLS Segment Proxy] error:', e?.message || e);
-        res.status(500).send('Internal error');
+        if (!res.headersSent) res.status(500);
+        res.end();
     }
 });
 
