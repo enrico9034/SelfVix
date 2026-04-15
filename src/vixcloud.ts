@@ -1,11 +1,43 @@
 import * as cheerio from 'cheerio';
-import { request } from 'undici';
+import { request, Dispatcher } from 'undici';
+import { socksDispatcher } from 'fetch-socks';
 import { config } from './config';
 import { makeProxyToken, VIXCLOUD_HEADERS } from './proxy';
 
 const ANIMEMAPPING_BASE = 'https://animemapping.stremio.dpdns.org';
 const AU_BASE = 'https://www.animeunity.so';
 const AU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
+
+// Optional SOCKS/HTTP proxy used ONLY for AnimeUnity requests, to bypass
+// Cloudflare ASN blocks (error 1005) on cloud hosts like Oracle/Hetzner.
+// Examples: socks5h://warp:1080 , socks5://127.0.0.1:1080
+let auDispatcher: Dispatcher | undefined;
+(() => {
+    const raw = process.env.AU_PROXY;
+    if (!raw) return;
+    try {
+        const u = new URL(raw);
+        const proto = u.protocol.replace(':', '').toLowerCase();
+        if (proto.startsWith('socks')) {
+            auDispatcher = socksDispatcher({
+                type: proto === 'socks4' || proto === 'socks4a' ? 4 : 5,
+                host: u.hostname,
+                port: parseInt(u.port || '1080', 10),
+                userId: u.username ? decodeURIComponent(u.username) : undefined,
+                password: u.password ? decodeURIComponent(u.password) : undefined,
+            }) as unknown as Dispatcher;
+            console.log(`[VixCloud] AU_PROXY active: ${proto}://${u.hostname}:${u.port}`);
+        } else {
+            console.warn(`[VixCloud] AU_PROXY protocol ${proto} not supported (use socks5/socks5h)`);
+        }
+    } catch (err: any) {
+        console.warn(`[VixCloud] Invalid AU_PROXY: ${err?.message || err}`);
+    }
+})();
+
+function auReqOpts(extra: Record<string, any> = {}) {
+    return auDispatcher ? { ...extra, dispatcher: auDispatcher } : extra;
+}
 
 // ── Step 1: Resolve Kitsu ID → title + AnimeUnity path via animemapping ──
 async function resolveFromMapping(kitsuId: string, episodeNum: string): Promise<string | null> {
@@ -75,10 +107,13 @@ async function getKitsuTitle(kitsuId: string): Promise<string | null> {
 
 // ── Step 4: AnimeUnity session + search ──
 async function getAnimeUnitySession(): Promise<{csrfToken: string, cookie: string}> {
-    const { body, headers } = await request(AU_BASE, {
+    const { body, headers, statusCode } = await request(AU_BASE, auReqOpts({
         headers: { 'User-Agent': AU_UA }
-    });
+    }));
     const html = await body.text();
+    if (statusCode !== 200 || /error code:\s*\d+/i.test(html.slice(0, 200))) {
+        throw new Error(`AnimeUnity blocked (status ${statusCode}). Set AU_PROXY to a SOCKS proxy.`);
+    }
     const $ = cheerio.load(html);
     const csrfToken = $('meta[name="csrf-token"]').attr('content') || '';
     let cookie = '';
@@ -94,7 +129,7 @@ async function getAnimeUnitySession(): Promise<{csrfToken: string, cookie: strin
 }
 
 async function searchAnimeUnity(title: string, session: {csrfToken: string, cookie: string}): Promise<any[]> {
-    const { body } = await request(`${AU_BASE}/livesearch`, {
+    const { body, statusCode, headers } = await request(`${AU_BASE}/livesearch`, auReqOpts({
         method: 'POST',
         headers: {
             'User-Agent': AU_UA,
@@ -105,7 +140,13 @@ async function searchAnimeUnity(title: string, session: {csrfToken: string, cook
             'Cookie': session.cookie
         },
         body: JSON.stringify({ title })
-    });
+    }));
+    const ctype = String(headers['content-type'] || '');
+    if (statusCode !== 200 || !ctype.includes('json')) {
+        const preview = (await body.text()).slice(0, 120);
+        console.log(`[VixCloud] livesearch blocked (status ${statusCode}): ${preview}`);
+        return [];
+    }
     const result: any = await body.json();
     return result?.records || [];
 }
@@ -114,11 +155,15 @@ async function searchAnimeUnity(title: string, session: {csrfToken: string, cook
 async function getEmbedUrl(animePath: string, episodeNum: number): Promise<string | null> {
     const animeUrl = animePath.startsWith('http') ? animePath : `${AU_BASE}${animePath}`;
     console.log(`[VixCloud] Fetching anime page: ${animeUrl}`);
-    
-    const { body } = await request(animeUrl, {
+
+    const { body, statusCode } = await request(animeUrl, auReqOpts({
         headers: { 'User-Agent': AU_UA }
-    });
+    }));
     const html = await body.text();
+    if (statusCode !== 200 || /error code:\s*\d+/i.test(html.slice(0, 200))) {
+        console.log(`[VixCloud] AnimeUnity page blocked (status ${statusCode}) — set AU_PROXY to a SOCKS proxy to bypass`);
+        return null;
+    }
     const $ = cheerio.load(html);
     
     const vp = $('video-player').first();
@@ -159,9 +204,9 @@ async function getEmbedUrl(animePath: string, episodeNum: number): Promise<strin
     const epPageUrl = `${animeUrl}/${targetEp.id}`;
     console.log(`[VixCloud] Fetching episode page: ${epPageUrl}`);
     
-    const { body: epBody } = await request(epPageUrl, {
+    const { body: epBody } = await request(epPageUrl, auReqOpts({
         headers: { 'User-Agent': AU_UA }
-    });
+    }));
     const epHtml = await epBody.text();
     const $ep = cheerio.load(epHtml);
     
