@@ -59,55 +59,91 @@ function inferLang(pathOrTitle: string): 'ITA' | 'SUB' {
 // Language filter from env (ita | sub | both). Default: both.
 const AU_LANG_PREF = ((process.env.AU_LANG || 'both').toLowerCase()) as 'ita' | 'sub' | 'both';
 
-// ── Step 1: Resolve Kitsu ID → all AnimeUnity paths via animemapping ──
-async function resolveFromMapping(kitsuId: string, episodeNum: string): Promise<string[]> {
+export type MappingProvider = 'kitsu' | 'imdb' | 'tmdb' | 'mal' | 'anilist';
+
+interface MappingResult {
+    paths: string[];
+    episode: number;
+}
+
+// Small TTL cache for mapping lookups. Key = provider:id:s:ep.
+const MAPPING_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
+const mappingCache = new Map<string, { value: MappingResult, expires: number }>();
+
+function cacheGet(key: string): MappingResult | null {
+    const hit = mappingCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expires) {
+        mappingCache.delete(key);
+        return null;
+    }
+    return hit.value;
+}
+
+function cacheSet(key: string, value: MappingResult) {
+    // Prevent unbounded growth
+    if (mappingCache.size > 500) {
+        const firstKey = mappingCache.keys().next().value;
+        if (firstKey) mappingCache.delete(firstKey);
+    }
+    mappingCache.set(key, { value, expires: Date.now() + MAPPING_CACHE_TTL_MS });
+}
+
+// ── Resolve any provider ID (kitsu/imdb/tmdb/...) → AU paths + remapped ep ──
+async function resolveMapping(
+    provider: MappingProvider,
+    externalId: string,
+    season: number | undefined,
+    episodeNum: number
+): Promise<MappingResult> {
+    const cacheKey = `${provider}:${externalId}:${season || ''}:${episodeNum}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+        console.log(`[VixCloud] Mapping cache hit: ${cacheKey} → ${cached.paths.length} path(s)`);
+        return cached;
+    }
+
+    const empty: MappingResult = { paths: [], episode: episodeNum };
     try {
-        const ep = parseInt(episodeNum) || 1;
-        const url = `${ANIMEMAPPING_BASE}/kitsu/${kitsuId}?ep=${ep}`;
+        const qs = new URLSearchParams();
+        if (season) qs.set('s', String(season));
+        qs.set('ep', String(episodeNum));
+        const url = `${ANIMEMAPPING_BASE}/${provider}/${encodeURIComponent(externalId)}?${qs.toString()}`;
         console.log(`[VixCloud] Fetching mapping: ${url}`);
+
         const { body, statusCode } = await request(url, { headers: { 'Accept': 'application/json' } });
         if (statusCode !== 200) {
-            console.log(`[VixCloud] Mapping API returned ${statusCode}`);
-            return [];
+            console.log(`[VixCloud] Mapping API returned ${statusCode} for ${provider}:${externalId}`);
+            cacheSet(cacheKey, empty);
+            return empty;
         }
         const data: any = await body.json();
 
         const auMapping = data?.mappings?.animeunity;
-        if (!auMapping) {
-            console.log(`[VixCloud] No AnimeUnity path in mapping response`);
-            return [];
-        }
-        const items = Array.isArray(auMapping) ? auMapping : [auMapping];
-        const out: string[] = [];
+        const items = auMapping ? (Array.isArray(auMapping) ? auMapping : [auMapping]) : [];
+        const paths: string[] = [];
         for (const item of items) {
             const path = typeof item === 'string' ? item : (item?.path || item?.url || item?.href || null);
-            if (path && !out.includes(path)) out.push(path);
+            if (path && !paths.includes(path)) paths.push(path);
         }
-        if (out.length) console.log(`[VixCloud] Mapping found ${out.length} AnimeUnity path(s): ${out.join(', ')}`);
-        return out;
+
+        // Remapped episode (handles absolute episode numbering across seasons)
+        const fromKitsu = data?.kitsu?.episode;
+        const fromRequested = data?.requested?.episode;
+        const remappedEp =
+            (typeof fromKitsu === 'number' && fromKitsu > 0) ? fromKitsu :
+            (typeof fromRequested === 'number' && fromRequested > 0) ? fromRequested :
+            episodeNum;
+
+        const result: MappingResult = { paths, episode: remappedEp };
+        cacheSet(cacheKey, result);
+
+        if (paths.length) console.log(`[VixCloud] Mapping found ${paths.length} AU path(s), ep→${remappedEp}: ${paths.join(', ')}`);
+        else console.log(`[VixCloud] No AU paths in mapping for ${provider}:${externalId}`);
+        return result;
     } catch (err: any) {
         console.error('[VixCloud] Mapping API error:', err?.message || err);
-        return [];
-    }
-}
-
-// ── Step 2: Get episode number from mapping (handles absolute episode remapping) ──
-async function resolveEpisodeFromMapping(kitsuId: string, episodeNum: string): Promise<number> {
-    try {
-        const ep = parseInt(episodeNum) || 1;
-        const url = `${ANIMEMAPPING_BASE}/kitsu/${kitsuId}?ep=${ep}`;
-        const { body, statusCode } = await request(url, { headers: { 'Accept': 'application/json' } });
-        if (statusCode !== 200) return ep;
-        const data: any = await body.json();
-        
-        // Check for remapped episode number
-        const fromKitsu = data?.kitsu?.episode;
-        if (fromKitsu && typeof fromKitsu === 'number' && fromKitsu > 0) return fromKitsu;
-        const fromRequested = data?.requested?.episode;
-        if (fromRequested && typeof fromRequested === 'number' && fromRequested > 0) return fromRequested;
-        return ep;
-    } catch {
-        return parseInt(episodeNum) || 1;
+        return empty;
     }
 }
 
@@ -340,18 +376,25 @@ function ensureM3u8(url: string): string {
 }
 
 // ── Main entry point ──
-export async function getVixCloudStreams(kitsuId: string, episodeNumber: string = "1"): Promise<{name: string, title: string, url: string}[]> {
+export async function getVixCloudStreams(
+    provider: MappingProvider,
+    externalId: string,
+    season: number | undefined,
+    episodeNumber: string = "1"
+): Promise<{name: string, title: string, url: string}[]> {
     try {
-        console.log(`[VixCloud] Resolving kitsu:${kitsuId} ep=${episodeNumber}`);
+        const epNum = parseInt(episodeNumber) || 1;
+        console.log(`[VixCloud] Resolving ${provider}:${externalId} s=${season ?? '-'} ep=${epNum}`);
 
-        const resolvedEp = await resolveEpisodeFromMapping(kitsuId, episodeNumber);
-        let paths = await resolveFromMapping(kitsuId, episodeNumber);
+        const mapping = await resolveMapping(provider, externalId, season, epNum);
+        const resolvedEp = mapping.episode;
+        let paths = mapping.paths;
 
-        // Fallback: search AnimeUnity by title (single result)
-        if (paths.length === 0) {
-            const title = await getKitsuTitle(kitsuId);
+        // Fallback: search AnimeUnity by title (only works when we have a Kitsu ID to look up canonical title)
+        if (paths.length === 0 && provider === 'kitsu') {
+            const title = await getKitsuTitle(externalId);
             if (!title) {
-                console.log(`[VixCloud] Could not resolve title for kitsu:${kitsuId}`);
+                console.log(`[VixCloud] Could not resolve title for kitsu:${externalId}`);
                 return [];
             }
             console.log(`[VixCloud] Searching AnimeUnity for title: "${title}"`);
@@ -367,6 +410,8 @@ export async function getVixCloudStreams(kitsuId: string, episodeNumber: string 
             paths = [`/anime/${anime.id}-${anime.slug}`];
             console.log(`[VixCloud] Found AnimeUnity: id=${anime.id} slug=${anime.slug}`);
         }
+
+        if (paths.length === 0) return [];
 
         // Apply language preference from AU_LANG env (ita | sub | both)
         if (AU_LANG_PREF === 'ita' || AU_LANG_PREF === 'sub') {

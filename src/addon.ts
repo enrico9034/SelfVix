@@ -21,6 +21,49 @@ const manifest = {
 
 const builder = new addonBuilder(manifest as any);
 
+// Parse a Stremio stream id into (provider, externalId, season, episode).
+// Supported forms:
+//   kitsu:N           (movie / single-entry anime)
+//   kitsu:N:EP        (series)
+//   ttXXXXXXX         (movie IMDb)
+//   ttXXXXXXX:S:E     (series IMDb)
+//   tmdb:N            (movie TMDB)
+//   tmdb:N:S:E        (series TMDB)
+function parseStreamId(id: string): {
+    provider: 'kitsu' | 'imdb' | 'tmdb';
+    externalId: string;
+    season?: number;
+    episode?: number;
+} | null {
+    if (!id) return null;
+    const parts = id.split(':');
+
+    if (parts[0] === 'kitsu') {
+        return {
+            provider: 'kitsu',
+            externalId: parts[1],
+            episode: parts[2] ? parseInt(parts[2], 10) : undefined,
+        };
+    }
+    if (parts[0] === 'tmdb') {
+        return {
+            provider: 'tmdb',
+            externalId: parts[1],
+            season: parts[2] ? parseInt(parts[2], 10) : undefined,
+            episode: parts[3] ? parseInt(parts[3], 10) : undefined,
+        };
+    }
+    if (parts[0] && parts[0].startsWith('tt')) {
+        return {
+            provider: 'imdb',
+            externalId: parts[0],
+            season: parts[1] ? parseInt(parts[1], 10) : undefined,
+            episode: parts[2] ? parseInt(parts[2], 10) : undefined,
+        };
+    }
+    return null;
+}
+
 builder.defineStreamHandler(async (args: any) => {
     // Standardize args: sometimes 'type' contains the args object when called manually via SDK interface
     let type = args.type;
@@ -35,45 +78,33 @@ builder.defineStreamHandler(async (args: any) => {
 
     console.log("Stream request normalized:", { type, id });
 
-    try {
-        if (id && id.startsWith('kitsu:')) {
-            const parts = id.split(':');
-            const kitsuId = parts[1];
-            const episodeNum = parts[2] || '1';
-            const streams = await getVixCloudStreams(kitsuId, episodeNum);
-            return { streams };
-        }
+    const parsed = parseStreamId(id);
+    if (!parsed) return { streams: [] };
 
-        if (type === 'movie' || type === 'series') {
-            let tmdbId = id;
-            let season: string | undefined;
-            let episode: string | undefined;
+    const { provider, externalId, season, episode } = parsed;
+    const epStr = episode ? String(episode) : '1';
 
-            if (type === 'movie') {
-                if (id.startsWith('tmdb:')) {
-                    tmdbId = id.split(':')[1];
-                }
-            } else if (type === 'series') {
-                const parts = id.split(':');
-                if (parts[0] === 'tmdb') {
-                    tmdbId = parts[1];
-                    season = parts[2];
-                    episode = parts[3];
-                } else if (parts[0].startsWith('tt')) {
-                    tmdbId = parts[0];
-                    season = parts[1];
-                    episode = parts[2];
-                }
-            }
+    // Build tasks based on provider. Anime providers (kitsu) only go to AU.
+    // IMDb/TMDB try both VixSrc and AnimeUnity (via mapping) in parallel.
+    const tasks: Promise<any[]>[] = [];
 
-            const streams = await getVixSrcStreams(tmdbId, season, episode);
-            return { streams };
-        }
-    } catch (err) {
-        console.error("Handler error:", err);
+    if (provider === 'kitsu') {
+        tasks.push(getVixCloudStreams('kitsu', externalId, season, epStr));
+    } else {
+        // VixSrc handles movies (and series with season/episode)
+        const vsrcId = provider === 'imdb' ? externalId : externalId;
+        tasks.push(getVixSrcStreams(vsrcId, season ? String(season) : undefined, episode ? String(episode) : undefined));
+        // AU via mapping — may 404 for non-anime content; that's fine.
+        tasks.push(getVixCloudStreams(provider, externalId, season, epStr));
     }
 
-    return { streams: [] };
+    const results = await Promise.allSettled(tasks);
+    const streams: any[] = [];
+    for (const r of results) {
+        if (r.status === 'fulfilled' && Array.isArray(r.value)) streams.push(...r.value);
+        else if (r.status === 'rejected') console.error("Handler task error:", r.reason?.message || r.reason);
+    }
+    return { streams };
 });
 
 const addonInterface = builder.getInterface();
