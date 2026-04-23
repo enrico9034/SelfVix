@@ -6,7 +6,7 @@ RUN apk add --no-cache git
 WORKDIR /app
 
 # Clona il repository direttamente nella cartella /app (branch configurabile)
-ARG BRANCH=myrepo
+ARG BRANCH=main
 RUN git clone --depth 1 --branch ${BRANCH} https://github.com/enrico9034/SelfVix .
 
 # Installa le dipendenze
