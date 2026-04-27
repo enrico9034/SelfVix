@@ -2,9 +2,40 @@ const { addonBuilder } = require('stremio-addon-sdk');
 import { getVixSrcStreams } from './vixsrc';
 import { getVixCloudStreams } from './vixcloud';
 import { decodeProxyToken, resolveUrl, makeProxyToken, getAddonBase } from './proxy';
-import { request } from 'undici';
+import { request, Agent, setGlobalDispatcher } from 'undici';
+import { socksConnector } from 'fetch-socks';
 const express = require('express');
 import { generateLandingPage } from './landing';
+
+// ── Global SOCKS dispatcher (WARP) ──
+// When WARP_PROXY is set, EVERY outgoing HTTP via undici/fetch goes through it.
+// Cloudflare bans cloud ASNs (Oracle/Hetzner/etc) on vixsrc.to/vixcloud.co/animeunity.so,
+// and CDN segment hosts can change at any time, so global routing is the only resilient
+// option. WARP egress is whitelisted by Cloudflare, so requests succeed.
+// Example: WARP_PROXY=socks5h://warp:1080 (use socks5h to resolve DNS through the proxy).
+(() => {
+    const raw = process.env.WARP_PROXY;
+    if (!raw) return;
+    try {
+        const u = new URL(raw);
+        const proto = u.protocol.replace(':', '').toLowerCase();
+        if (!proto.startsWith('socks')) {
+            console.warn(`[Proxy] WARP_PROXY protocol ${proto} not supported (use socks5/socks5h)`);
+            return;
+        }
+        const connect = socksConnector({
+            type: proto === 'socks4' || proto === 'socks4a' ? 4 : 5,
+            host: u.hostname,
+            port: parseInt(u.port || '1080', 10),
+            userId: u.username ? decodeURIComponent(u.username) : undefined,
+            password: u.password ? decodeURIComponent(u.password) : undefined,
+        });
+        setGlobalDispatcher(new Agent({ connect: connect as any }));
+        console.log(`[Proxy] Global dispatcher → SOCKS ${u.hostname}:${u.port} (all outbound HTTP)`);
+    } catch (err: any) {
+        console.warn(`[Proxy] Invalid WARP_PROXY: ${err?.message || err}`);
+    }
+})();
 
 const manifest = {
     id: 'org.selfvix.simple',
@@ -174,6 +205,7 @@ app.get('/proxy/hls/manifest.m3u8', async (req: any, res: any) => {
 
         const { body, statusCode } = await request(upstream, { headers });
         if (statusCode !== 200) {
+            console.warn(`[HLS Proxy] Upstream ${statusCode} for ${upstream.substring(0, 120)}`);
             return res.status(502).send(`#EXTM3U\n# Upstream error ${statusCode}`);
         }
 
@@ -300,6 +332,7 @@ app.get('/proxy/hls/segment.ts', async (req: any, res: any) => {
 
         const { body, statusCode, headers: respHeaders } = await request(upstream, { headers });
         if (statusCode !== 200) {
+            console.warn(`[HLS Segment Proxy] Upstream ${statusCode} for ${upstream.substring(0, 120)}`);
             body.destroy?.();
             return res.status(statusCode || 502).send('Upstream error');
         }
