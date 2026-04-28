@@ -11,6 +11,10 @@ const AU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 // When WARP_PROXY is configured there, every outbound request (including AU)
 // is routed through SOCKS automatically — no per-host plumbing needed here.
 
+// Timeouts so a stuck SOCKS/upstream connection fails fast instead of hanging
+// for undici's 5-min default — Stremio gives up on the addon long before that.
+const LOOKUP_TIMEOUTS = { headersTimeout: 8000, bodyTimeout: 15000 } as const;
+
 // Infer dub language from AU path or slug. "-ita" segment → ITA dub, else SUB.
 function inferLang(pathOrTitle: string): 'ITA' | 'SUB' {
     return /(?:^|[-_/])ita(?:[-_/]|$)/i.test(pathOrTitle) ? 'ITA' : 'SUB';
@@ -71,7 +75,7 @@ async function resolveMapping(
         const url = `${ANIMEMAPPING_BASE}/${provider}/${encodeURIComponent(externalId)}?${qs.toString()}`;
         console.log(`[VixCloud] Fetching mapping: ${url}`);
 
-        const { body, statusCode } = await request(url, { headers: { 'Accept': 'application/json' } });
+        const { body, statusCode } = await request(url, { headers: { 'Accept': 'application/json' }, ...LOOKUP_TIMEOUTS });
         if (statusCode !== 200) {
             console.log(`[VixCloud] Mapping API returned ${statusCode} for ${provider}:${externalId}`);
             cacheSet(cacheKey, empty);
@@ -110,7 +114,7 @@ async function resolveMapping(
 // ── Step 3: Kitsu canonical title fallback ──
 async function getKitsuTitle(kitsuId: string): Promise<string | null> {
     try {
-        const { body, statusCode } = await request(`https://kitsu.io/api/edge/anime/${kitsuId}`);
+        const { body, statusCode } = await request(`https://kitsu.io/api/edge/anime/${kitsuId}`, { ...LOOKUP_TIMEOUTS });
         if (statusCode !== 200) return null;
         const data: any = await body.json();
         const attr = data?.data?.attributes;
@@ -123,7 +127,8 @@ async function getKitsuTitle(kitsuId: string): Promise<string | null> {
 // ── Step 4: AnimeUnity session + search ──
 async function getAnimeUnitySession(): Promise<{csrfToken: string, cookie: string}> {
     const { body, headers, statusCode } = await request(AU_BASE, {
-        headers: { 'User-Agent': AU_UA }
+        headers: { 'User-Agent': AU_UA },
+        ...LOOKUP_TIMEOUTS
     });
     const html = await body.text();
     if (statusCode !== 200 || /error code:\s*\d+/i.test(html.slice(0, 200))) {
@@ -154,7 +159,8 @@ async function searchAnimeUnity(title: string, session: {csrfToken: string, cook
             'Referer': AU_BASE + '/',
             'Cookie': session.cookie
         },
-        body: JSON.stringify({ title })
+        body: JSON.stringify({ title }),
+        ...LOOKUP_TIMEOUTS
     });
     const ctype = String(headers['content-type'] || '');
     if (statusCode !== 200 || !ctype.includes('json')) {
@@ -172,7 +178,8 @@ async function getEmbedUrl(animePath: string, episodeNum: number): Promise<strin
     console.log(`[VixCloud] Fetching anime page: ${animeUrl}`);
 
     const { body, statusCode } = await request(animeUrl, {
-        headers: { 'User-Agent': AU_UA }
+        headers: { 'User-Agent': AU_UA },
+        ...LOOKUP_TIMEOUTS
     });
     const html = await body.text();
     if (statusCode !== 200 || /error code:\s*\d+/i.test(html.slice(0, 200))) {
@@ -220,7 +227,8 @@ async function getEmbedUrl(animePath: string, episodeNum: number): Promise<strin
     console.log(`[VixCloud] Fetching episode page: ${epPageUrl}`);
     
     const { body: epBody } = await request(epPageUrl, {
-        headers: { 'User-Agent': AU_UA }
+        headers: { 'User-Agent': AU_UA },
+        ...LOOKUP_TIMEOUTS
     });
     const epHtml = await epBody.text();
     const $ep = cheerio.load(epHtml);
@@ -247,7 +255,8 @@ async function extractVixCloudManifest(embedUrl: string): Promise<string | null>
     const asnFromInput = inputUrlObj.searchParams.get('asn');
 
     const { body, statusCode } = await request(embedUrl, {
-        headers: VIXCLOUD_HEADERS
+        headers: VIXCLOUD_HEADERS,
+        ...LOOKUP_TIMEOUTS
     });
 
     let html = "";

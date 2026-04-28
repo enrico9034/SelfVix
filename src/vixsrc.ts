@@ -7,6 +7,10 @@ import { makeProxyToken, VIXSRC_HEADERS } from './proxy';
 // When WARP_PROXY is configured there, every outbound request (including VixSrc)
 // is routed through SOCKS automatically — no per-host plumbing needed here.
 
+// Timeouts so a stuck SOCKS/upstream connection fails fast instead of hanging
+// for undici's 5-min default — Stremio gives up on the addon long before that.
+const LOOKUP_TIMEOUTS = { headersTimeout: 8000, bodyTimeout: 15000 } as const;
+
 /**
  * Resolve the current embed URL through VixSrc JSON API.
  */
@@ -29,7 +33,8 @@ async function getEmbedUrlFromApi(tmdbId: string, season?: string, episode?: str
                 ...VIXSRC_HEADERS,
                 'Accept': 'application/json, text/plain, */*',
                 'Referer': `${siteOrigin}/`
-            }
+            },
+            ...LOOKUP_TIMEOUTS
         });
 
         if (statusCode !== 200) {
@@ -69,7 +74,8 @@ export async function getVixSrcStreams(tmdbId: string, season?: string, episode?
             headers: {
                 ...VIXSRC_HEADERS,
                 'Referer': `${siteOrigin}/`
-            }
+            },
+            ...LOOKUP_TIMEOUTS
         });
 
         if (statusCode !== 200) {
